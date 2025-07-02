@@ -1,39 +1,18 @@
-# Importing required libraries and modules
-from llama_index.llms.openai import OpenAI
-import logging
-from typing import Any, Dict, List, Optional, cast
-import uuid
-import os
-
-# LlamaIndex internals for schema and vector store support
-from llama_index.core.base.embeddings.base import DEFAULT_EMBED_BATCH_SIZE
-from llama_index.core.bridge.pydantic import Field, PrivateAttr
-from llama_index.core.schema import BaseNode, MetadataMode, TextNode
-from llama_index.core.vector_stores.types import(
-    BasePydanticVectorStore,
-    MetadataFilters,
-    VectorStoreQuery,
-    VectorStoreQueryMode,
-    VectorStoreQueryResult,
-)
-from llama_index.core.vector_stores.utils import (
-    legacy_metadata_dict_to_node,
-    metadata_dict_to_node,
-    node_to_metadata_dict,
-)
-from llama_index.core.vector_stores.types import BasePydanticVectorStore
-
 # Moorcheh SDK for backend vector storage
 from moorcheh_sdk import MoorchehClient, MoorchehError
 from moorcheh_sdk import MoorchehClient
 from typing import ClassVar
 from pydantic import Field, PrivateAttr, model_validator
-from google.colab import userdata
+
+ID_KEY = "id"
+VECTOR_KEY = "values"
+SPARSE_VECTOR_KEY = "sparse_values"
+METADATA_KEY = "metadata"
 
 # Logger for debug/info/error output
 logger = logging.getLogger(__name__)
 
-class MoorchehVectorStore():
+class MoorchehVectorStore(BasePydanticVectorStore):
     """Moorcheh Vector Store.
 
     In this vector store, embeddings and docs are stored within a Moorcheh namespace.
@@ -56,30 +35,57 @@ class MoorchehVectorStore():
     stores_text: bool = True
     flat_metadata: bool = True
 
-    def __init__(self, api_key, namespace, namespace_type="text", vector_dimension=None, batch_size=64):
+    
+    api_key: Optional[str]
+    namespace: Optional[str] 
+    namespace_type: Optional[str] 
+    vector_dimension: Optional[int]
+    add_sparse_vector: Optional[bool]
+    batch_size: int 
+    
+
+    sparse_embedding_model: Optional[BaseSparseEmbedding] = None
+
+    def __init__(
+            self, 
+            api_key: Optional[str] = None,
+            namespace: Optional[str] = None, 
+            namespace_type: Optional[str] = None, 
+            vector_dimension: Optional[str] = None, 
+            add_sparse_vector: Optional[bool] = False,
+            tokenizer: Optional[Callable] = None,
+            batch_size: int = 64,
+            sparse_embedding_model: Optional[BaseSparseEmbedding] = None
+            ) -> None:
         # Initialize store attributes
-        self.api_key=api_key
-        self.namespace=namespace
-        self.namespace_type=namespace_type
-        self.vector_dimension=vector_dimension
-        self.batch_size=batch_size
+        if add_sparse_vector:
+            if sparse_embedding_model is not None:
+                sparse_embedding_model = sparse_embedding_model
+            elif tokenizer is not None:
+                sparse_embedding_model = DefaultMoorchehSparseEmbedding(
+                    tokenizer=tokenizer
+                )
+            else:
+                sparse_embedding_model = DefaultMoorchehSparseEmbedding()
+        else:
+            sparse_embedding_model = None
+        
+        super().__init__(
+            api_key=api_key,
+            namespace=namespace,
+            namespace_type=namespace_type,
+            vector_dimension=vector_dimension,
+            add_sparse_vector=add_sparse_vector,
+            batch_size=batch_size,
+            sparse_embedding_model=sparse_embedding_model
+        )
 
         # Initialize Moorcheh client
         self._client = MoorchehClient(api_key=self.api_key, base_url="https://wnc4zvnuok.execute-api.us-east-1.amazonaws.com/v1")
         self.is_embedding_query=False
+        self._sparse_embedding_model = sparse_embedding_model
 
-    '''
-    api_key: Optional[str] = Field(default=None)
-    namespace: Optional[str] = Field(default="llamaindex_default")
-    namespace_type: Optional[str] = Field(default="text")
-    vector_dimension: Optional[int] = Field(default=None)
-    batch_size: int = Field(default=64)
-    '''
-    # _client: MoorchehClient = PrivateAttr()
-
-
-    def model_post_init(self):
-        # Fallback to env var if API key not provided
+                # Fallback to env var if API key not provided
         if not self.api_key:
             self.api_key = os.getenv("MOORCHEH_API_KEY")
         if not self.api_key:
@@ -112,6 +118,13 @@ class MoorchehVectorStore():
 
 
         print("[DEBUG] MoorchehVectorStore initialization complete.")
+    
+
+    # _client: MoorchehClient = PrivateAttr()
+
+
+    
+
 
 
     @property
@@ -149,6 +162,7 @@ class MoorchehVectorStore():
         """Add text documents to a text namespace."""
         documents = []
         ids = []
+        sparse_inputs = []
 
         for node in nodes:
             node_id = node.node_id or str(uuid.uuid4())
@@ -162,8 +176,21 @@ class MoorchehVectorStore():
             # Add metadata if present
             if node.metadata:
                 document["metadata"] = node.metadata
+            
+            if self.add_sparse_vector and self._sparse_embedding_model is not None:
+                sparse_inputs.append(node.get_content(metadata_mode=MetadataMode.EMBED))
 
             documents.append(document)
+
+            if sparse_inputs:
+                sparse_vectors = self._sparse_embedding_model.get_text_embedding_batch(
+                sparse_inputs
+            )
+                for i, sparse_vector in enumerate(sparse_vectors):
+                    documents[i][SPARSE_VECTOR_KEY] = {
+                        "indices": list(sparse_vector.keys()),
+                        "values": list(sparse_vector.values()),
+                    }
 
         # Process in batches
         for i in range(0, len(documents), self.batch_size):
@@ -184,6 +211,7 @@ class MoorchehVectorStore():
         """Add vector nodes to vector namespace."""
         vectors = []
         ids = []
+        sparse_inputs = []
 
         for node in nodes:
             if node.embedding is None:
@@ -196,14 +224,27 @@ class MoorchehVectorStore():
                 "id": node_id,
                 "vector": node.embedding,
             }
-
+            
             # Add metadata, including text content
             metadata = dict(node.metadata) if node.metadata else {}
             metadata["text"] = metadata.pop("text", node.get_content(metadata_mode=MetadataMode.NONE))
             vector["metadata"] = metadata
 
-            vectors.append(vector)
+            if self.add_sparse_vector and self._sparse_embedding_model is not None:
+                sparse_inputs.append(node.get_content(metadata_mode=MetadataMode.EMBED))
 
+            vectors.append(vector)
+            
+            
+            if sparse_inputs:
+                sparse_vectors = self._sparse_embedding_model.get_text_embedding_batch(
+                sparse_inputs
+            )
+                for i, sparse_vector in enumerate(sparse_vectors):
+                    documents[i][SPARSE_VECTOR_KEY] = {
+                        "indices": list(sparse_vector.keys()),
+                        "values": list(sparse_vector.values()),
+                    }
         # Process in batches
         for i in range(0, len(vectors), self.batch_size):
             batch = vectors[i : i + self.batch_size]
@@ -251,11 +292,35 @@ class MoorchehVectorStore():
             VectorStoreQueryResult: query result
 
         """
+        moorcheh_sparse_vector = None
+        if (
+            query.mode in (VectorStoreQueryMode.SPARSE, VectorStoreQueryMode.HYBRID)
+            and self._sparse_embedding_model is not None
+        ):
+            if query.query_str is None:
+                raise ValueError(
+                    "query_str must be specified if mode is SPARSE or HYBRID."
+                )
+            sparse_vector = self._sparse_embedding_model.get_query_embedding(
+                query.query_str
+            )
+            if query.alpha is not None:
+                moorcheh_sparse_vector = {
+                    "indices": list(sparse_vector.keys()),
+                    "values": [v * (1 - query.alpha) for v in sparse_vector.values()],
+                }
+            else:
+                moorcheh_sparse_vector = {
+                    "indices": list(sparse_vector.keys()),
+                    "values": list(sparse_vector.values()),
+                }
+        '''
         if query.mode != VectorStoreQueryMode.DEFAULT:
             logger.warning(
                 f"Moorcheh does not support query mode {query.mode}. "
                 "Using default mode instead."
             )
+        '''
 
         # Prepare search parameters
         search_kwargs = {
