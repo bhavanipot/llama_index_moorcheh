@@ -59,25 +59,27 @@ class MoorchehVectorStore(BasePydanticVectorStore):
     stores_text: bool = True
     flat_metadata: bool = True
 
-    
+
     api_key: Optional[str]
-    namespace: Optional[str] 
-    namespace_type: Optional[str] 
+    namespace: Optional[str]
+    namespace_type: Optional[str]
     vector_dimension: Optional[int]
     add_sparse_vector: Optional[bool]
-    batch_size: int 
-    
+    ai_model: Optional[str]
+    batch_size: int
+
 
     sparse_embedding_model: Optional[BaseSparseEmbedding] = None
 
     def __init__(
-            self, 
+            self,
             api_key: Optional[str] = None,
-            namespace: Optional[str] = None, 
-            namespace_type: Optional[str] = None, 
-            vector_dimension: Optional[str] = None, 
+            namespace: Optional[str] = None,
+            namespace_type: Optional[str] = None,
+            vector_dimension: Optional[str] = None,
             add_sparse_vector: Optional[bool] = False,
             tokenizer: Optional[Callable] = None,
+            ai_model: Optional[str] = "anthropic.claude-3-7-sonnet-20250219-v1:0",
             batch_size: int = 64,
             sparse_embedding_model: Optional[BaseSparseEmbedding] = None
             ) -> None:
@@ -93,7 +95,7 @@ class MoorchehVectorStore(BasePydanticVectorStore):
                 sparse_embedding_model = DefaultMoorchehSparseEmbedding()
         else:
             sparse_embedding_model = None
-        
+
         super().__init__(
             api_key=api_key,
             namespace=namespace,
@@ -101,7 +103,8 @@ class MoorchehVectorStore(BasePydanticVectorStore):
             vector_dimension=vector_dimension,
             add_sparse_vector=add_sparse_vector,
             batch_size=batch_size,
-            sparse_embedding_model=sparse_embedding_model
+            sparse_embedding_model=sparse_embedding_model,
+            ai_model=ai_model
         )
 
         # Initialize Moorcheh client
@@ -142,12 +145,12 @@ class MoorchehVectorStore(BasePydanticVectorStore):
 
 
         print("[DEBUG] MoorchehVectorStore initialization complete.")
-    
+
 
     # _client: MoorchehClient = PrivateAttr()
 
 
-    
+
 
 
 
@@ -200,7 +203,7 @@ class MoorchehVectorStore(BasePydanticVectorStore):
             # Add metadata if present
             if node.metadata:
                 document["metadata"] = node.metadata
-            
+
             if self.add_sparse_vector and self._sparse_embedding_model is not None:
                 sparse_inputs.append(node.get_content(metadata_mode=MetadataMode.EMBED))
 
@@ -248,7 +251,7 @@ class MoorchehVectorStore(BasePydanticVectorStore):
                 "id": node_id,
                 "vector": node.embedding,
             }
-            
+
             # Add metadata, including text content
             metadata = dict(node.metadata) if node.metadata else {}
             metadata["text"] = metadata.pop("text", node.get_content(metadata_mode=MetadataMode.NONE))
@@ -258,8 +261,8 @@ class MoorchehVectorStore(BasePydanticVectorStore):
                 sparse_inputs.append(node.get_content(metadata_mode=MetadataMode.EMBED))
 
             vectors.append(vector)
-            
-            
+
+
             if sparse_inputs:
                 sparse_vectors = self._sparse_embedding_model.get_text_embedding_batch(
                 sparse_inputs
@@ -420,6 +423,7 @@ class MoorchehVectorStore(BasePydanticVectorStore):
         self,
         query: str,
         top_k: int = 5,
+        ai_model: str = "anthropic.claude-3-7-sonnet-20250219-v1:0",
         **kwargs: Any,
     ) -> str:
         """Get a generative AI answer using Moorcheh's built-in RAG capability.
@@ -440,6 +444,7 @@ class MoorchehVectorStore(BasePydanticVectorStore):
                 namespace=self.namespace,
                 query=query,
                 top_k=top_k,
+                ai_model = ai_model,
                 **kwargs,
             )
             return result.get("answer", "")
